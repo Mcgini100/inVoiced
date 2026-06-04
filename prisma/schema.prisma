@@ -1,0 +1,30 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Transaction {
+  id          String   @id @default(uuid())
+  type        String   // "INCOME", "EXPENSE", "TRANSFER"
+  context     String   // "BUSINESS", "PERSONAL"
+  amount      Float
+  currency    String   // "USD", "ZWG"
+  method      String   // "CASH", "ECOCASH", "INNSBUCKS", "BANK"
+  description String?
+  streetRate  Float?   // The parallel exchange rate against USD used on that day
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model UserSettings {
+  id              String   @id @default("default_user")
+  streetRateZWG   Float    @default(25.0) // Placeholder street rate for ZiG
+  updatedAt       DateTime @updatedAt
+}
