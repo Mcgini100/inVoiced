@@ -1,36 +1,69 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# inVoiced
 
-## Getting Started
+Voice-to-ledger bookkeeping for Zimbabwe's multi-currency economy. Press the mic, say something like
+*"sold two bags of maize for twenty US on EcoCash"* or *"paid 150 bonds for transport"*, and inVoiced
+transcribes it, extracts a structured transaction and adds it to a USD / ZiG (ZWG) ledger.
 
-First, run the development server:
+## What it does
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+- **Voice capture**: records audio in the browser (`MediaRecorder`) and posts it to `/api/process-audio`.
+- **Transcription**: OpenAI Whisper (`whisper-1`).
+- **Structured extraction**: GPT-4o-mini in JSON mode turns the transcript into
+  `{type, context, amount, currency, method, description}`. The prompt maps local terms
+  ("bonds", "RTGS", "Zim dollars" → ZWG) and payment methods (EcoCash, InnBucks, bank/swipe, cash).
+- **Voice corrections**: the last transaction is passed as context, so *"change that last one to USD"*
+  updates the previous entry instead of creating a new one.
+- **Multi-currency balances**: separate USD and ZWG balances; transfers between them use the street
+  (parallel market) rate saved with each transaction, and the rate is editable in the UI.
+- **Ledger management**: recent transactions list with inline edit and delete, manual transfer form,
+  business vs personal tagging, light/dark theme.
+
+## Architecture
+
+```
+Browser (Next.js App Router, React 19, Tailwind)
+  │  mic audio (webm)                 server actions (list, balances, edit, delete, transfer, rate)
+  ▼                                          │
+POST /api/process-audio ─────────────────────┤
+  │ 1. Whisper  → transcript                  │
+  │ 2. GPT-4o-mini (JSON mode) → transaction  │
+  │    or correction of the last one          │
+  ▼                                          ▼
+Prisma ORM ──────────────► SQLite (Transaction, UserSettings)
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+| Path | Role |
+|---|---|
+| `src/app/page.tsx` | Single-page UI: recorder, balances, transfer form, transaction list |
+| `src/app/api/process-audio/route.ts` | Whisper transcription + LLM extraction + DB write |
+| `src/app/actions.ts` | Server actions for reads, balances, edits, transfers, settings |
+| `prisma/schema.prisma` | `Transaction` and `UserSettings` models |
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Setup
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Requirements: Node.js 20+, an OpenAI API key.
 
-## Learn More
+```bash
+git clone https://github.com/Mcgini100/inVoiced.git
+cd inVoiced
+npm ci
+cp .env.example .env          # then put your OpenAI key in .env
+npx prisma db push            # creates prisma/dev.db from the schema
+npm run dev                   # http://localhost:3000
+```
 
-To learn more about Next.js, take a look at the following resources:
+Microphone access needs `localhost` or HTTPS.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+### Environment variables (`.env.example`)
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+| Variable | Purpose |
+|---|---|
+| `OPENAI_API_KEY` | Whisper transcription and GPT-4o-mini extraction |
+| `DATABASE_URL` | Prisma SQLite connection string, e.g. `file:./dev.db` |
 
-## Deploy on Vercel
+The local database (`prisma/dev.db`) is git-ignored; each developer creates their own with `npx prisma db push`.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## Tech stack
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Next.js 16 (App Router, server actions) · React 19 · TypeScript · Tailwind CSS · Prisma 5 + SQLite ·
+OpenAI Node SDK (Whisper, GPT-4o-mini) · Zustand · lucide-react
