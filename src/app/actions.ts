@@ -1,137 +1,103 @@
 "use server";
-import { PrismaClient } from "@prisma/client";
 
-const prisma = new PrismaClient();
+import { cookies } from "next/headers";
+import type { z } from "zod";
+import type { DashboardData } from "@/lib/domain";
+import { env } from "@/lib/env";
+import { AppError, type PublicError, toPublicError } from "@/lib/errors";
+import { errorFields, log } from "@/lib/log";
+import { SESSION_COOKIE, authDeps, clientIp, getRepo, requireLedger } from "@/server/context";
+import { enforceLimit } from "@/server/ratelimit";
+import { CursorSchema, EditInputSchema, EntryInputSchema, IdSchema, RateInputSchema, TransferInputSchema } from "@/server/schemas";
+import { endSession, requestOtp, verifyOtp } from "@/server/services/auth";
+import { createEntry, createTransfer, editTransaction, getDashboard, setMyRate, voidTransaction } from "@/server/services/ledger";
 
-export async function getTransactions() {
+export type Result<T> = { ok: true; data: T } | { ok: false; error: PublicError };
+
+async function run<T>(name: string, fn: () => Promise<T>): Promise<Result<T>> {
   try {
-    const transactions = await prisma.transaction.findMany({
-      orderBy: { createdAt: "desc" },
-      take: 15,
-    });
-    return transactions;
-  } catch (error) {
-    console.error("Error fetching transactions:", error);
-    return [];
+    return { ok: true, data: await fn() };
+  } catch (err) {
+    if (!(err instanceof AppError)) log("error", "action.failed", { action: name, ...errorFields(err) });
+    return { ok: false, error: toPublicError(err) };
   }
 }
 
-export async function getBalances() {
-  try {
-    const transactions = await prisma.transaction.findMany();
-    
-    let usdBalance = 0;
-    let zwgBalance = 0;
+function parse<S extends z.ZodType>(schema: S, input: unknown): z.infer<S> {
+  const result = schema.safeParse(input);
+  if (!result.success) throw new AppError("VALIDATION", "Please check the details and try again.");
+  return result.data;
+}
 
-    for (const t of transactions) {
-      const modifier = t.type === "INCOME" ? 1 : t.type === "EXPENSE" ? -1 : 0;
-      
-      if (t.type === "TRANSFER") {
-        // Transferring from one currency to another using the street rate recorded at the time
-        const rate = t.streetRate || 25.0;
-        if (t.currency === "USD") {
-          // Transferring USD -> ZWG
-          usdBalance -= t.amount;
-          zwgBalance += t.amount * rate;
-        } else if (t.currency === "ZWG") {
-          // Transferring ZWG -> USD
-          zwgBalance -= t.amount;
-          usdBalance += t.amount / rate;
-        }
-      } else {
-        if (t.currency === "USD") usdBalance += t.amount * modifier;
-        if (t.currency === "ZWG") zwgBalance += t.amount * modifier;
-      }
+/** Authenticated, rate-limited mutation that answers with the refreshed dashboard. */
+async function mutate(name: string, fn: (ctx: Awaited<ReturnType<typeof requireLedger>>) => Promise<void>): Promise<Result<DashboardData>> {
+  return run(name, async () => {
+    const ctx = await requireLedger();
+    await enforceLimit(getRepo(), `mutate:${ctx.userId}`, 120, 60, new Date());
+    await fn(ctx);
+    return getDashboard(ctx);
+  });
+}
+
+export async function requestOtpAction(phone: unknown): Promise<Result<{ phone: string; devCode?: string }>> {
+  return run("requestOtp", async () => {
+    if (typeof phone !== "string" || phone.length > 32) throw new AppError("VALIDATION", "Enter a valid phone number.");
+    return requestOtp(authDeps(), { phone, ip: await clientIp() });
+  });
+}
+
+export async function verifyOtpAction(phone: unknown, code: unknown): Promise<Result<null>> {
+  return run("verifyOtp", async () => {
+    if (typeof phone !== "string" || typeof code !== "string" || phone.length > 32 || code.length > 16) {
+      throw new AppError("VALIDATION", "That code is not valid.");
     }
-
-    return { usdBalance, zwgBalance };
-  } catch (error) {
-    console.error("Error fetching balances:", error);
-    return { usdBalance: 0, zwgBalance: 0 };
-  }
-}
-
-export async function getUserSettings() {
-  try {
-    let settings = await prisma.userSettings.findUnique({ where: { id: "default_user" } });
-    if (!settings) {
-      settings = await prisma.userSettings.create({ data: { id: "default_user", streetRateZWG: 25.0 } });
-    }
-    return settings;
-  } catch (error) {
-    console.error("Error fetching settings:", error);
-    return { streetRateZWG: 25.0 };
-  }
-}
-
-export async function updateStreetRate(rate: number) {
-  try {
-    const settings = await prisma.userSettings.upsert({
-      where: { id: "default_user" },
-      update: { streetRateZWG: rate },
-      create: { id: "default_user", streetRateZWG: rate }
+    const { token, expiresAt } = await verifyOtp(authDeps(), { phone, code });
+    (await cookies()).set(SESSION_COOKIE, token, {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: env().NODE_ENV === "production",
+      path: "/",
+      expires: expiresAt,
     });
-    return settings.streetRateZWG;
-  } catch (error) {
-    console.error("Error updating street rate:", error);
-    throw error;
-  }
+    return null;
+  });
 }
 
-export async function updateTransaction(id: string, data: {
-  amount?: number;
-  currency?: string;
-  method?: string;
-  context?: string;
-  type?: string;
-  description?: string;
-}) {
-  try {
-    const updated = await prisma.transaction.update({
-      where: { id },
-      data
-    });
-    return updated;
-  } catch (error) {
-    console.error("Error updating transaction:", error);
-    throw error;
-  }
+export async function logoutAction(): Promise<Result<null>> {
+  return run("logout", async () => {
+    const store = await cookies();
+    await endSession(getRepo(), store.get(SESSION_COOKIE)?.value);
+    store.delete(SESSION_COOKIE);
+    return null;
+  });
 }
 
-export async function createTransfer(data: {
-  amount: number;
-  currency: string;
-  method: string;
-  description: string;
-  streetRate: number;
-}) {
-  try {
-    const created = await prisma.transaction.create({
-      data: {
-        type: "TRANSFER",
-        context: "PERSONAL",
-        amount: data.amount,
-        currency: data.currency,
-        method: data.method,
-        description: data.description,
-        streetRate: data.streetRate
-      }
-    });
-    return created;
-  } catch (error) {
-    console.error("Error creating transfer:", error);
-    throw error;
-  }
+export async function loadMoreAction(cursor: unknown): Promise<Result<DashboardData>> {
+  return run("loadMore", async () => getDashboard(await requireLedger(), parse(CursorSchema, cursor)));
 }
 
-export async function deleteTransaction(id: string) {
-  try {
-    await prisma.transaction.delete({
-      where: { id }
-    });
-    return true;
-  } catch (error) {
-    console.error("Error deleting transaction:", error);
-    throw error;
-  }
+export async function setRateAction(rate: unknown): Promise<Result<DashboardData>> {
+  return mutate("setRate", (ctx) => setMyRate(ctx, parse(RateInputSchema, rate)));
+}
+
+export async function addEntryAction(input: unknown): Promise<Result<DashboardData>> {
+  return mutate("addEntry", async (ctx) => {
+    await createEntry(ctx, parse(EntryInputSchema, input));
+  });
+}
+
+export async function editTransactionAction(id: unknown, input: unknown): Promise<Result<DashboardData>> {
+  return mutate("editTransaction", async (ctx) => {
+    await editTransaction(ctx, parse(IdSchema, id), parse(EditInputSchema, input));
+  });
+}
+
+export async function deleteTransactionAction(id: unknown): Promise<Result<DashboardData>> {
+  return mutate("deleteTransaction", (ctx) => voidTransaction(ctx, parse(IdSchema, id)));
+}
+
+export async function transferAction(input: unknown): Promise<Result<DashboardData>> {
+  return mutate("transfer", async (ctx) => {
+    await createTransfer(ctx, parse(TransferInputSchema, input));
+  });
 }

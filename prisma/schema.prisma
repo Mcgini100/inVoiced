@@ -1,30 +1,121 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
+// inVoiced data model (phase 0).
+// Money is stored in integer minor units (cents). Rates are ZWG per 1 USD.
+// String columns hold small closed sets that are validated with Zod at every
+// boundary (see src/lib/domain.ts) so adding a value never needs an enum migration.
 
 generator client {
-  provider = "prisma-client-js"
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "debian-openssl-3.0.x"]
 }
 
 datasource db {
-  provider = "sqlite"
+  provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
-model Transaction {
-  id          String   @id @default(uuid())
-  type        String   // "INCOME", "EXPENSE", "TRANSFER"
-  context     String   // "BUSINESS", "PERSONAL"
-  amount      Float
-  currency    String   // "USD", "ZWG"
-  method      String   // "CASH", "ECOCASH", "INNSBUCKS", "BANK"
-  description String?
-  streetRate  Float?   // The parallel exchange rate against USD used on that day
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+model User {
+  id          String       @id @default(uuid())
+  phone       String       @unique // E.164
+  name        String?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  memberships Membership[]
+  sessions    Session[]
 }
 
-model UserSettings {
-  id              String   @id @default("default_user")
-  streetRateZWG   Float    @default(25.0) // Placeholder street rate for ZiG
-  updatedAt       DateTime @updatedAt
+model Business {
+  id           String        @id @default(uuid())
+  name         String
+  myRate       Decimal?      @db.Decimal(18, 6) // the owner's own ZWG-per-USD rate; null until they set it
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  memberships  Membership[]
+  sessions     Session[]
+  transactions Transaction[]
+  auditLogs    AuditLog[]
+}
+
+model Membership {
+  id         String   @id @default(uuid())
+  userId     String
+  businessId String
+  role       String // "OWNER" | "STAFF"
+  createdAt  DateTime @default(now())
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, businessId])
+  @@index([businessId])
+}
+
+model Session {
+  id         String   @id @default(uuid())
+  tokenHash  String   @unique // sha256 of the cookie token; the raw token is never stored
+  userId     String
+  businessId String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([businessId])
+}
+
+model OtpChallenge {
+  id         String    @id @default(uuid())
+  phone      String
+  codeHash   String
+  expiresAt  DateTime
+  attempts   Int       @default(0)
+  consumedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([phone, createdAt])
+}
+
+model Transaction {
+  id            String   @id @default(uuid())
+  businessId    String
+  type          String // "INCOME" | "EXPENSE" | "TRANSFER"
+  context       String // "BUSINESS" | "PERSONAL"
+  amountMinor   BigInt // always positive; for a transfer this is the amount leaving `currency`
+  currency      String // "USD" | "ZWG"
+  method        String // "CASH" | "ECOCASH" | "ONEMONEY" | "INNBUCKS" | "OMARI" | "BANK"
+  description   String?
+  rate          Decimal? @db.Decimal(18, 6) // ZWG per USD in force when the entry was made
+  toCurrency    String? // transfers only: the currency received
+  toAmountMinor BigInt? // transfers only: the amount received, fixed at creation
+  status        String   @default("POSTED") // "POSTED" | "VOID"; rows are never hard-deleted
+  source        String // "VOICE" | "MANUAL" | "IMPORT"
+  transcript    String?
+  createdById   String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  business      Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId, status, createdAt])
+}
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  businessId String
+  userId     String?
+  action     String
+  entity     String
+  entityId   String
+  before     Json?
+  after      Json?
+  createdAt  DateTime @default(now())
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId, createdAt])
+}
+
+model RateLimitBucket {
+  key         String
+  windowStart DateTime
+  count       Int      @default(0)
+
+  @@id([key, windowStart])
 }

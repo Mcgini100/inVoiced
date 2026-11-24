@@ -41,6 +41,8 @@ html, body {
 }
 
 body {
+  /* System fonts for now: nothing to download on a slow connection. The redesign picks self-hosted faces. */
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   min-height: 100%;
   display: flex;
   flex-direction: column;

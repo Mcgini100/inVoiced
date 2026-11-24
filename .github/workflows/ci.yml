@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: invoiced
+          POSTGRES_PASSWORD: invoiced
+          POSTGRES_DB: invoiced
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U invoiced" --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      DATABASE_URL: postgresql://invoiced:invoiced@localhost:5432/invoiced?schema=public
+      TEST_DATABASE_URL: postgresql://invoiced:invoiced@localhost:5432/invoiced?schema=public
+      SHADOW_DATABASE_URL: postgresql://invoiced:invoiced@localhost:5432/shadow?schema=public
+      AUTH_SECRET: ci-only-secret-ci-only-secret-ci-only
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx prisma generate
+      - name: Apply migrations
+        run: npx prisma migrate deploy
+      - name: Migrations match schema.prisma
+        run: |
+          PGPASSWORD=invoiced psql -h localhost -U invoiced -d invoiced -c 'CREATE DATABASE shadow'
+          npx prisma migrate diff --from-migrations prisma/migrations --to-schema-datamodel prisma/schema.prisma --shadow-database-url "$SHADOW_DATABASE_URL" --exit-code
+      - run: npm run typecheck
+      - run: npm run lint
+      - name: Tests (in-memory and Postgres)
+        run: npm test
+      - run: npm run build
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start the stack from a fresh clone
+        run: |
+          cp .env.example .env
+          echo "AUTH_SECRET=ci-only-secret-ci-only-secret-ci-only" >> .env
+          docker compose up --build --detach --wait
+      - name: Smoke test
+        run: |
+          set -eux
+          test "$(curl -s http://127.0.0.1:3000/api/health)" = '{"status":"ok"}'
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/)" = "307"
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/login)" = "200"
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST -F audio=@package.json http://127.0.0.1:3000/api/captures)" = "401"
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Cookie: inv_session=forged' -F audio=@package.json http://127.0.0.1:3000/api/captures)" = "401"
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs --no-color

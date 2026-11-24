@@ -1,0 +1,50 @@
+# Reverse proxy for inVoiced. The microphone only works over HTTPS, so TLS is required.
+# Replace books.example.co.zw and the certificate paths, then: nginx -t && systemctl reload nginx
+
+limit_req_zone $binary_remote_addr zone=invoiced_api:10m rate=10r/s;
+
+server {
+    listen 80;
+    server_name books.example.co.zw;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name books.example.co.zw;
+
+    ssl_certificate     /etc/letsencrypt/live/books.example.co.zw/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/books.example.co.zw/privkey.pem;
+
+    # Recordings are capped at 10 MB by the app; reject anything bigger before it reaches Node.
+    client_max_body_size 11m;
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy strict-origin-when-cross-origin always;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        # Overwrite, do not append: the app rate-limits on the first address in this header.
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_read_timeout 60s;
+    }
+
+    location /api/ {
+        limit_req zone=invoiced_api burst=20 nodelay;
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_read_timeout 60s;
+    }
+}

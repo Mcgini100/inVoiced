@@ -1,0 +1,54 @@
+# Local and single-server deployment: Postgres, a one-shot migration job, and the app.
+#   cp .env.example .env   (set AUTH_SECRET)   then   docker compose up --build
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: invoiced
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-invoiced}
+      POSTGRES_DB: invoiced
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U invoiced -d invoiced"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    build:
+      context: .
+      target: deps
+    command: ["npx", "prisma", "migrate", "deploy"]
+    environment:
+      DATABASE_URL: postgresql://invoiced:${POSTGRES_PASSWORD:-invoiced}@db:5432/invoiced?schema=public
+    depends_on:
+      db:
+        condition: service_healthy
+
+  app:
+    build:
+      context: .
+    environment:
+      DATABASE_URL: postgresql://invoiced:${POSTGRES_PASSWORD:-invoiced}@db:5432/invoiced?schema=public
+      AUTH_SECRET: ${AUTH_SECRET:?Set AUTH_SECRET in .env (openssl rand -base64 48)}
+      OTP_PROVIDER: ${OTP_PROVIDER:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ASR_MODEL: ${ASR_MODEL:-whisper-1}
+      ASR_LANGUAGE: ${ASR_LANGUAGE:-}
+      EXTRACT_MODEL: ${EXTRACT_MODEL:-gpt-4o-mini}
+      CAPTURE_DAILY_LIMIT: ${CAPTURE_DAILY_LIMIT:-200}
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+volumes:
+  pgdata:
